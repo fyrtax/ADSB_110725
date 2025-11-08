@@ -69,13 +69,25 @@ KEEP_ALL_TRACKS = 0
 # 1 = Yes, 0 = No
 PLOT_AIRPORTS = 1
 
-# Distance threshold for loading airports (in miles)
+# 10. Distance threshold for loading airports (in miles)
 # Only airports within this distance from the receiver will be plotted
 AIRPORT_DISTANCE = 100
 
-# World borders painting distance (in miles)
+# 11. Plot world map
+# 1 = Yes, 0 = No;
+PLOT_WORLD_BORDERS = 1
+
+# 12. World borders painting distance (in miles)
 # Only countries within this distance from the receiver will be plotted
 WORLD_BORDER_DISTANCE = 200
+
+# 13. Plot European regions on the map
+# 1 = Yes, 0 = No;
+PLOT_REGIONS = 1
+
+# 14. Region painting distance (in miles)
+# Only regions within this distance from the receiver will be plotted
+REGION_DISTANCE = 200
 
 # --- END CONFIGURATION ---
 
@@ -159,7 +171,10 @@ def getAirportLocations():
 
 def getWorldBorders():
     # Get data from Eurostat
-    url = "https://gisco-services.ec.europa.eu/distribution/v2/countries/geojson/CNTR_RG_20M_2024_4326.geojson"
+    url = "https://gisco-services.ec.europa.eu/distribution/v2/countries/geojson/CNTR_RG_10M_2024_4326.geojson"
+
+    if PLOT_WORLD_BORDERS == 0:
+        return None
 
     # Check if the file exists, if not download it
     if not os.path.exists('world_borders.geojson'):
@@ -223,6 +238,83 @@ def getWorldBorders():
         return None
 
 
+def getRegions():
+    """Get European regions"""
+    url = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_10M_2024_4326.geojson"
+
+    if PLOT_REGIONS == 0:
+        return None
+
+    # Check if the file exists, if not download it
+    if not os.path.exists('regions.geojson'):
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            with open('regions.geojson', 'w', encoding='utf-8') as f:
+                f.write(response.text)
+            print("Downloaded regions.geojson")
+        except Exception as e:
+            print(f"Failed to download regions.geojson: {e}")
+            return None
+
+    try:
+        import json
+        with open('regions.geojson', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        receiver_pos = (RECEIVER_LAT, RECEIVER_LON)
+        filtered_features = []
+
+        for feature in data.get('features', []):
+            # Filter only NUTS level 2 (regions/voivodeships)
+            properties = feature.get('properties', {})
+            levl_code = properties.get('LEVL_CODE')
+
+            # LEVL_CODE 2 = regions (województwa in Poland)
+            if levl_code != 2:
+                continue
+
+            # Get geometry coordinates to check if region is nearby
+            geometry = feature.get('geometry', {})
+            if geometry.get('type') == 'Polygon':
+                coords = geometry.get('coordinates', [[]])[0]
+            elif geometry.get('type') == 'MultiPolygon':
+                coords = []
+                for polygon in geometry.get('coordinates', []):
+                    coords.extend(polygon[0])
+            else:
+                continue
+
+            # Check if any point in the geometry is within range
+            within_range = False
+            for coord in coords[:100]:  # Sample first 100 points for performance
+                if len(coord) >= 2:
+                    point_pos = (coord[1], coord[0])  # GeoJSON is [lon, lat]
+                    try:
+                        dist_miles = haversine(receiver_pos, point_pos, unit=Unit.MILES)
+                        if dist_miles <= REGION_DISTANCE:
+                            within_range = True
+                            break
+                    except:
+                        continue
+
+            if within_range:
+                filtered_features.append(feature)
+
+        # Create new GeoJSON with filtered features
+        filtered_data = {
+            'type': 'FeatureCollection',
+            'features': filtered_features
+        }
+
+        print(f"Filtered to {len(filtered_features)} regions within {REGION_DISTANCE} miles")
+        return json.dumps(filtered_data)
+
+    except Exception as e:
+        print(f"Error reading regions.geojson: {e}")
+        return None
+
+
 class AdsbTracker(QMainWindow):
     """Main application window."""
 
@@ -250,6 +342,7 @@ class AdsbTracker(QMainWindow):
         self.current_zoom = MAP_START_ZOOM
 
         self.world_data = getWorldBorders()
+        self.regions_data = getRegions()
 
         self.initUI()
 
@@ -630,6 +723,24 @@ class AdsbTracker(QMainWindow):
                 data=self.world_data,
             ).add_to(m)
         # --- END MODIFICATION ---
+
+        # --- ADD: European Regions Layer ---
+        if self.regions_data:
+            region_style = lambda x: {
+                'fillColor': 'none',
+                'color': '#666666',
+                'weight': 0.5,
+                'fillOpacity': 0,
+            }
+
+            folium.GeoJson(
+                name='European Regions',
+                style_function=region_style,
+                overlay=True,
+                control=False,
+                data=self.regions_data,
+            ).add_to(m)
+        # --- END ADD ---
 
         # 2. Add a marker for the receiver (Triangle)
         folium.RegularPolygonMarker(
